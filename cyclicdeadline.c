@@ -137,11 +137,10 @@ static int shutdown;
 static pthread_barrier_t barrier;
 
 static int cpu_count;
-static cpu_set_t *cpusetp;
-static int cpuset_size;
+static int all_cpus;
 
-static int nr_threads = 2;
-static int use_nsecs = 0;
+static int nr_threads;
+static int use_nsecs;
 
 static int mark_fd;
 
@@ -650,6 +649,9 @@ static void teardown(void)
 {
 	int fd;
 
+	if (all_cpus)
+		return;
+
 	fd = open_cpuset(CPUSET_PATH, "cpuset.cpu_exclusive");
 	if (fd >= 0) {
 		write(fd, "0", 2);
@@ -1030,6 +1032,10 @@ static void loop(struct sched_data *sched_data, int nr_threads)
 		usleep(10000);
 		printf("\033[%dA", nr_threads);
 	}
+	usleep(10000);
+	for (i = 0; i < nr_threads; i++) {
+		printf("\n");
+	}
 }
 
 int main (int argc, char **argv)
@@ -1043,11 +1049,11 @@ int main (int argc, char **argv)
 	pthread_t *thread;
 	unsigned int interval = 1000;
 	unsigned int step = 500;
+	int percent = 60;
 	u64 runtime;
 	u64 start_period;
 	u64 end_period;
 	int nr_cpus;
-	int all_cpus = 0;
 	int i;
 	int c;
 
@@ -1061,6 +1067,8 @@ int main (int argc, char **argv)
 		switch (c) {
 		case 'a':
 			all_cpus = 1;
+			if (!nr_threads)
+				nr_threads = cpu_count;
 			break;
 		case 'c':
 			setcpu = optarg;
@@ -1080,16 +1088,19 @@ int main (int argc, char **argv)
 		}
 	}
 
+	if (!nr_threads)
+		nr_threads = 1;
+
 	if (setcpu) {
 		nr_cpus = calc_nr_cpus(setcpu, &setcpu_buf);
-		if (nr_cpus < 0) {
+		if (nr_cpus < 0 || nr_cpus > cpu_count) {
 			fprintf(stderr, "Invalid cpu input '%s'\n", setcpu);
 			exit(-1);
 		}
 	} else
-		nr_cpus = 1;
+		nr_cpus = cpu_count;
 
-	if (!all_cpus && setcpu && cpu_count == nr_cpus) {
+	if (!all_cpus && cpu_count == nr_cpus) {
 		printf("Using all CPUS\n");
 		all_cpus = 1;
 	}
@@ -1113,13 +1124,6 @@ int main (int argc, char **argv)
 		perror("mlockall");
 	}
 
-	cpusetp = CPU_ALLOC(cpu_count);
-	cpuset_size = CPU_ALLOC_SIZE(cpu_count);
-	if (!cpusetp) {
-		perror("allocating cpuset");
-		exit(-1);
-	}
-
 	setup_ftrace_marker();
 
 	thread = calloc(nr_threads, sizeof(*thread));
@@ -1129,6 +1133,14 @@ int main (int argc, char **argv)
 		exit(-1);
 	}
 
+	if (nr_threads > nr_cpus) {
+		/*
+		 * More threads than CPUs, then have the total be
+		 * no more than 80 percent.
+		 */
+		percent = nr_cpus * 80 / nr_threads;
+	}
+
 	/* Set up the data while sill in SCHED_FIFO */
 	for (i = 0; i < nr_threads; i++) {
 		sd = &sched_data[i];
@@ -1136,7 +1148,7 @@ int main (int argc, char **argv)
 		 * Interval is the deadline/period
 		 * The runtime is the percentage of that period.
 		 */
-		runtime = interval * 50 / 100;
+		runtime = interval * percent / 100;
 
 		if (runtime < 2000) {
 			/*
@@ -1192,7 +1204,6 @@ int main (int argc, char **argv)
 		int *pids;
 
 		res = make_cpuset(CPUSET_ALL, allcpu_buf, "0",
-//				  CPUSET_FL_CPU_EXCLUSIVE |
 				  CPUSET_FL_SET_LOADBALANCE |
 				  CPUSET_FL_CLONE_CHILDREN |
 				  CPUSET_FL_ALL_TASKS);
