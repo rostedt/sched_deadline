@@ -1,3 +1,34 @@
+/*
+ * Copyright (C) 2016 Red Hat Inc, Steven Rostedt <srostedt@redhat.com>
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License (not later!)
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not,  see <http://www.gnu.org/licenses>
+ *
+ * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ *
+ * deadline_test.c
+ *
+ * This program is used to test the deadline scheduler (SCHED_DEADLINE tasks).
+ * It is broken up into various degrees of complexity that can be set with
+ * options.
+ *
+ * Here are the test cases:
+ *
+ * 1) Simplest - create one deadline task that can migrate across all CPUS.
+ *    Look for "simple_test"
+ *
+ */
 #define _GNU_SOURCE
 #include <pthread.h>
 #include <stdarg.h>
@@ -21,7 +52,41 @@
 #include <linux/unistd.h>
 #include <linux/magic.h>
 
-#ifdef __i386__
+/**
+ * usage - show the usage of the program and exit.
+ * @argv: The program passed in args
+ *
+ * This is defined here to show people looking at this code how
+ * to use this program as well. 
+ */
+static void usage(char **argv)
+{
+	char *arg = argv[0];
+	char *p = arg+strlen(arg);
+
+	while (p >= arg && *p != '/')
+		p--;
+	p++;
+
+	printf("usage: %s [options]\n"
+	       " -h - Show this help menu\n"
+	       " -b - Bind on the last cpu. (shortcut for -c <lastcpu>)\n"
+	       " -r prio - Add an RT task with given prio to stress system\n"
+	       " -c cpulist - Comma/hyphen separated list of CPUs to run deadline tasks on\n"
+	       " -p percent - The percent of bandwidth to use (1-90%%)\n"
+	       " -P percent - The percent of runtime for execution completion\n"
+	       "              (Default 100%%)\n"
+	       " -t threads - The number of threads to run as deadline (default 1)\n"
+	       "\n", p);
+	exit(-1);
+}
+
+/*
+ * sched_setattr() and sched_getattr() are new system calls. We need to
+ * hardcode it here. For added measure, also define getcpu().
+ */
+#if defined(__i386__)
+
 #ifndef __NR_sched_setattr
 #define __NR_sched_setattr		351
 #endif
@@ -31,7 +96,9 @@
 #ifndef __NR_getcpu
 #define __NR_getcpu			309
 #endif
-#else /* x86_64 */
+
+#elif defined(__x86_64__)
+
 #ifndef __NR_sched_setattr
 #define __NR_sched_setattr		314
 #endif
@@ -41,20 +108,46 @@
 #ifndef __NR_getcpu
 #define __NR_getcpu			309
 #endif
+
 #endif /* i386 or x86_64 */
+
+#if !defined(__NR_getcpu)
+# error "Your arch does not support getcpu()"
+#endif
+
+#if !defined(__NR_sched_setattr)
+# error "Your arch does not support sched_setattr()"
+#endif
+
+#if !defined(__NR_sched_getattr)
+# error "Your arch does not support sched_getattr()"
+#endif
+
+/* If not included in the headers, define sched deadline policy numbe */
 #ifndef SCHED_DEADLINE
 #define SCHED_DEADLINE		6
 #endif
 
 #define _STR(x) #x
 #define STR(x) _STR(x)
+
+/* Max path for cpuset path names. 1K should be enough */
 #ifndef MAXPATH
 #define MAXPATH 1024
 #endif
 
+/*
+ * "my_cpuset" is the cpuset that will hold the SCHED_DEADLINE tasks that
+ * want to limit their affinity.
+ *
+ * "my_cpuset_all" is the cpuset that will have the affinity of all the
+ * other CPUs outside the ones for SCHED_DEADLINE threads. It will hold
+ * all other tasks.
+ */
 #define CPUSET_ALL	"my_cpuset_all"
 #define CPUSET_LOCAL	"my_cpuset"
 
+/* Define the system call interfaces */
 #define gettid() syscall(__NR_gettid)
 #define sched_setattr(pid, attr, flags) syscall(__NR_sched_setattr, pid, attr, flags)
 #define sched_getattr(pid, attr, size, flags) syscall(__NR_sched_getattr, pid, attr, size, flags)
@@ -64,6 +157,19 @@ typedef unsigned long long u64;
 typedef unsigned int u32;
 typedef int s32;
 
+/**
+ * struct sched_attr - get/set attr system call descriptor.
+ *
+ * This is the descriptor defined for setting SCHED_DEADLINE tasks.
+ * It will someday be in a header file.
+ *
+ * The fields specific for deadline:
+ *
+ *  @sched_policy: 6 is for deadline
+ *  @sched_runtime: The runtime in nanoseconds
+ *  @sched_deadline: The deadline in nanoseconds.
+ *  @sched_period: The period, if different than deadline (not used here)
+ */
 struct sched_attr {
 	u32 size;
 
@@ -82,10 +188,35 @@ struct sched_attr {
 	u64 sched_period;
 };
 
+/**
+ * struct sched_data - the descriptor for the threads.
+ *
+ * This is the descriptor that will be passed as the thread data.
+ * It is used as both input to the thread, as well as output to
+ * the main program.
+ *
+ * @runtime_us: The runtime for sched_deadline tasks in microseconds
+ * @deadline_us: The deadline for sched_deadline tasks in microseconds
+ * @loops_per_period: The amount of loops to run for the runtime
+ * @max_time: Recorded max time to complete loops
+ * @min_time: Recorded min time to complete loops
+ * @total_time: The total time of all periods to perform the loops
+ * @nr_periods: The number of periods executed
+ * @missed_periods: The number of periods that were missed (started late)
+ * @missed_deadlines: The number of deadlines that were missed (ended late)
+ * @total_adjust: The time in microseconds adjusted for starting early
+ * @last_time: Last runtime of loops (used to calculate runtime to give)
+ * @prio: The priority for SCHED_FIFO threads (uses same descriptor)
+ * @tid: Stores the thread ID of the thread.
+ * @vol: The number of voluntary schedules the thread made
+ * @nonvol: The number of non-voluntary schedules the thread made (preempted)
+ * @migrate: The number of migrations the thread made.
+ * @buff: A string buffer to store data to write to ftrace
+ *
+ */
 struct sched_data {
 	u64 runtime_us;
 	u64 deadline_us;
-	u64 loop_time;
 
 	u64 loops_per_period;
 
@@ -98,7 +229,6 @@ struct sched_data {
 	int missed_deadlines;
 	u64 total_adjust;
 
-	u64 last_deadline_missed;
 	u64 last_time;
 
 	int prio;
@@ -111,16 +241,30 @@ struct sched_data {
 	char buff[BUFSIZ+1];
 };
 
+/* Barrier to synchronize the threads for initialization */
 static pthread_barrier_t barrier;
 
+/* cpu_count is the number of detected cpus on the running machine */
 static int cpu_count;
+
+/*
+ * cpusetp and cpuset_size is for cpumasks, in case we run on a machine with
+ * more than 64 CPUs.
+ */
 static cpu_set_t *cpusetp;
 static int cpuset_size;
 
+/* Number of threads to create to run deadline scheduler with (default two) */
 static int nr_threads = 2;
 
-static int mark_fd;
-
+/**
+ * find_mount - Find if a file system type is already mounted
+ * @mount: The type of files system to find
+ * @debugfs: Where to place the path to the found file system.
+ *
+ * Returns 1 if found and sets @debugfs.
+ * Returns 0 otherwise.
+ */
 static int find_mount(const char *mount, char *debugfs)
 {
 	char type[100];
@@ -143,6 +287,12 @@ static int find_mount(const char *mount, char *debugfs)
 	return 1;
 }
 
+/**
+ * find_debugfs - Search for where debugfs is found
+ *
+ * Finds where debugfs is mounted and returns the path.
+ * The returned string is static and should not be modified.
+ */
 static const char *find_debugfs(void)
 {
 	static int debugfs_found;
@@ -159,6 +309,20 @@ static const char *find_debugfs(void)
 	return debugfs;
 }
 
+/**
+ * my_vsprintf - simplified vsprintf()
+ * @buf: The buffer to write the string to
+ * @size: The allocated size of @buf
+ * @fmmt: The format to parse
+ * @ap: The variable arguments
+ *
+ * Because there's no real way to prevent glibc's vsprintf from
+ * allocating more memory, or doing any type of system call,
+ * This is a simple version of the function that is under
+ * our control, to make sure we stay in userspace when creating
+ * a ftrace_write string, and only do a system call for the
+ * actual ftrace_write.
+ */
 static int my_vsprintf(char *buf, int size, const char *fmt, va_list ap)
 {
 	const char *p;
@@ -229,19 +393,19 @@ static int my_vsprintf(char *buf, int size, const char *fmt, va_list ap)
 	return s - buf;
 }
 
-#if 0
-static int my_sprintf(char *buf, int size, const char *fmt, ...)
-{
-	va_list ap;
-	int n;
+/* The ftrace tracing_marker file descriptor to write to ftrace */
+static int mark_fd;
 
-	va_start(ap, fmt);
-	n = vsnprintf(buf, size, fmt, ap);
-	va_end(ap);
-	return n;
-}
-#endif
-
+/**
+ * ftrace_write - write a string to ftrace tracing_marker
+ * @buf: A BUFSIZ + 1 allocated scratch pad
+ * @fmt: The format of the sting to write
+ * @va_arg: The arguments for @fmt
+ *
+ * If mark_fd is not less than zero, format the input
+ * and write it out to trace_marker (where mark_fd is a file
+ * descriptor of).
+ */
 static void ftrace_write(char *buf, const char *fmt, ...)
 {
 	va_list ap;
@@ -257,6 +421,18 @@ static void ftrace_write(char *buf, const char *fmt, ...)
 	write(mark_fd, buf, n);
 }
 
+/**
+ * setup_ftrace_marker - Check if trace_marker exists and open if it does
+ *
+ * Tests if debugfs is mounted, and if it is, it tests to see if the
+ * trace_marker exists. If it does, it opens trace_marker and sets
+ * mark_fd to the file descriptor. Then ftrace_write() will be able
+ * to write to the ftrace marker, otherwise ftrace_write() becomes
+ * a nop.
+ *
+ * Failure to open the trace_marker file will not stop this application
+ * from executing. Only ftrace writes will not be performed.
+ */
 static void setup_ftrace_marker(void)
 {
 	struct stat st;
@@ -277,6 +453,17 @@ found:
 	mark_fd = open(files, O_WRONLY);
 }
 
+/**
+ * setup_hr_tick - Enable the HRTICK in sched_features (if available)
+ *
+ * SCHED_DEADLINE tasks are based on HZ, which could be as slow as
+ * 100 times a second (10ms). Which is incredibly slow for scheduling.
+ * For SCHED_DEADLINE to have finer resolution, HRTICK feature must be
+ * set. That's located in the debugfs/sched_features directory.
+ *
+ * This will not mount debugfs. If debugfs is not mounted, this simply
+ * will fail.
+ */
 static int setup_hr_tick(void)
 {
 	const char *debugfs = find_debugfs();
@@ -337,6 +524,15 @@ static int setup_hr_tick(void)
 	return ret;
 }
 
+/**
+ * mounted - test if a path is mounted via the given mount type
+ * @path: The path to check is mounted
+ * @magic: The magic number of the mount type.
+ *
+ * Returns -1 if the path does not exist.
+ * Returns 0 if it is mounted but not of the given @magic type.
+ * Returns 1 if mounted and the @magic type matches.
+ */
 static int mounted(const char *path, long magic)
 {
 	struct statfs st_fs;
@@ -351,6 +547,17 @@ static int mounted(const char *path, long magic)
 #define CGROUP_PATH "/sys/fs/cgroup"
 #define CPUSET_PATH CGROUP_PATH "/cpuset"
 
+/**
+ * open_cpuset - open a file (usually a cpuset file)
+ * @path: The path of the directory the file is in
+ * @name: The name of the file in the path to open.
+ *
+ * Open a file, used to open cpuset files. This function simply is
+ * made to open many files in the same directory.
+ *
+ * Returns the file descriptor of the opened file or less than zero
+ * on error.
+ */
 static int open_cpuset(const char *path, const char *name)
 {
 	char buf[MAXPATH];
@@ -369,6 +576,20 @@ static int open_cpuset(const char *path, const char *name)
 	return fd;
 }
 
+/**
+ * mount_cpuset - Inialize the cpuset system
+ *
+ * Looks to see if cgroups are mounted, if it is not, then it mounts
+ * the cgroup_root to /sys/fs/cgroup. Then the directory cpuset exists
+ * and is mounted in that directory. If it is not, it is created and
+ * mounted.
+ *
+ * The toplevel cpuset "cpu_exclusive" flag is set, this allows child
+ * cpusets to set the flag too.
+ *
+ * The toplevel cpuset "load_balance" flag is cleared, letting the
+ * child cpusets take over load balancing.
+ */
 static int mount_cpuset(void)
 {
 	struct stat st;
@@ -414,6 +635,17 @@ static int mount_cpuset(void)
 	return 0;
 }
 
+/*
+ * CPUSET flags: used for creating cpusets
+ *
+ *  CPU_EXCLUSIVE - Set the cpu exclusive flag
+ *  MEM_EXCLUSIVE - Set the mem exclusive flag
+ *  ALL_TASKS - Move all tasks from the toplevel cpuset to this one
+ *  TASKS - Supply a list of thread IDs to move to this cpuset
+ *  CLEAR_LOADBALANCE - clear the loadbalance flag
+ *  SET_LOADBALANCE - set the loadbalance flag
+ *  CLONE_CHILDREN - set the clone_children flag
+ */
 enum {
 	CPUSET_FL_CPU_EXCLUSIVE		= (1 << 0),
 	CPUSET_FL_MEM_EXCLUSIVE		= (1 << 1),
@@ -424,6 +656,22 @@ enum {
 	CPUSET_FL_CLONE_CHILDREN	= (1 << 6),
 };
 
+/**
+ * make_cpuset - create a cpuset
+ * @name: The name of the cpuset
+ * @cpus: A string list of cpus this set is for e.g. "1,3,4-7"
+ * @mems: The memory nodes to use (usually just "0") (set to NULL to ignore)
+ * @flags: See the CPUSET_FL_* flags above for information
+ * @va_args: An array of tasks to move if TASKS flag is set.
+ *
+ * Creates a cpuset.
+ *
+ * If TASKS is set, then @va_args will be an array of PIDs to move from
+ * the main cpuset, to this cpuset. The last element of the array must
+ * be a zero, to stop the processing of arrays.
+ *
+ * Returns NULL on success, and a string to describe what went wrong on error.
+ */
 static const char *make_cpuset(const char *name, const char *cpus,
 			       const char *mems, unsigned flags, ...)
 {
@@ -442,6 +690,7 @@ static const char *make_cpuset(const char *name, const char *cpus,
 	if (ret < 0)
 		return "mount_cpuset";
 
+	/* Only create the new cpuset directory if it does not yet exist */
 	ret = stat(path, &st);
 	if (ret < 0) {
 		ret = mkdir(path, 0755);
@@ -449,6 +698,7 @@ static const char *make_cpuset(const char *name, const char *cpus,
 			return "mkdir";
 	}
 
+	/* Assign the CPUs */
 	fd = open_cpuset(path, "cpuset.cpus");
 	if (fd < 0)
 		return "cset";
@@ -457,6 +707,7 @@ static const char *make_cpuset(const char *name, const char *cpus,
 	if (ret < 0)
 		return "write cpus";
 
+	/* Assign the "mems" if it exists */
 	if (mems) {
 		fd = open_cpuset(path, "cpuset.mems");
 		if (fd < 0)
@@ -501,6 +752,7 @@ static const char *make_cpuset(const char *name, const char *cpus,
 	}
 
 
+	/* If TASKS flag is set, then an array of tasks is passed it */
 	if (flags & CPUSET_FL_TASKS) {
 		int *pids;
 		int i;
@@ -513,9 +765,13 @@ static const char *make_cpuset(const char *name, const char *cpus,
 
 		ret = 0;
 		pids = va_arg(ap, int *);
+
+		/* The array ends with pids[i] == 0 */
 		for (i = 0; pids[i]; i++) {
 			sprintf(buf, "%d ", pids[i]);
 			ret = write(fd, buf, strlen(buf));
+			if (ret < 0)
+				break;
 		}
 		va_end(ap);
 		close(fd);
@@ -525,6 +781,7 @@ static const char *make_cpuset(const char *name, const char *cpus,
 		}
 	}
 
+	/* If ALL_TASKS flag is set, move all tasks from the top level cpuset */
 	if (flags & CPUSET_FL_ALL_TASKS) {
 		FILE *fp;
 		int pid;
@@ -541,7 +798,8 @@ static const char *make_cpuset(const char *name, const char *cpus,
 			sprintf(buf, "%d", pid);
 			ret = write(fd, buf, strlen(buf));
 			/*
-			 * Tasks can come and go, the only error we care
+			 * Tasks can come and go, and some tasks are kernel
+			 * threads that cannot be moved. The only error we care
 			 * about is ENOSPC, as that means something went
 			 * wrong that we did not expect.
 			 */
@@ -558,6 +816,14 @@ static const char *make_cpuset(const char *name, const char *cpus,
 	return NULL;
 }
 
+/**
+ * destroy_cpuset - tear down a cpuset that was created
+ * @name: The name of the cpuset to destroy
+ * @print: If the tasks being moved should be displayed
+ *
+ * Reads the tasks in the cpuset and moves them to the top level cpuset
+ * then destroys the @name cpuset.
+ */
 static void destroy_cpuset(const char *name, int print)
 {
 	struct stat st;
@@ -570,20 +836,28 @@ static void destroy_cpuset(const char *name, int print)
 	int retry = 0;
 
 	printf("Removing %s\n", name);
+
+	/* Set path to the cpuset name that we will destroy */
 	snprintf(path, MAXPATH - 1, "%s/%s", CPUSET_PATH, name);
 	path[MAXPATH - 1] = 0;
 
+	/* Make sure it exists! */
 	ret = stat(path, &st);
 	if (ret < 0)
 		return;
 
  again:
+	/*
+	 * Append "/tasks" to the cpuset name, to read the tasks that are
+	 * in this cpuset, that must be moved before destroying the cpuset.
+	 */
 	strncat(path, "/tasks", MAXPATH - 1);
 	if ((fp = fopen(path,"r")) == NULL) {
 		fprintf(stderr, "Failed opening %s\n", path);
 		perror("fopen");
 		return;
 	}
+	/* Set path to the toplevel cpuset tasks file */
 	snprintf(path, MAXPATH - 1, "%s/tasks", CPUSET_PATH);
 	path[MAXPATH - 1] = 0;
 
@@ -595,6 +869,12 @@ static void destroy_cpuset(const char *name, int print)
 		return;
 	}
 
+	/*
+	 * Now fp points to the destroying cpuset tasks file, and
+	 * fd is the toplevel cpuset file descriptor. Scan in the
+	 * tasks that are in the cpuset that is being destroyed and
+	 * write their pids into the toplevel cpuset.
+	 */
 	while (fscanf(fp, "%d", &pid) == 1) {
 		sprintf(buf, "%d", pid);
 		if (print)
@@ -604,13 +884,20 @@ static void destroy_cpuset(const char *name, int print)
 	fclose(fp);
 	close(fd);
 
+	/* Reset the path name back to the cpuset to destroy */
 	snprintf(path, MAXPATH - 1, "%s/%s", CPUSET_PATH, name);
 	path[MAXPATH - 1] = 0;
 
-//	return;
+	/* Sleep a bit to let all tasks migrate out of this cpuset. */
 	sleep(1);
+
 	ret = rmdir(path);
 	if (ret < 0) {
+		/*
+		 * Sometimes there appears to be a delay, and tasks don't
+		 * always move when you expect them to. Try 5 times, and
+		 * give up after that.
+		 */
 		if (retry++ < 5)
 			goto again;
 		fprintf(stderr, "Failed to remove %s\n", path);
@@ -622,6 +909,12 @@ static void destroy_cpuset(const char *name, int print)
 	}
 }
 
+/**
+ * teardown - Called atexit() to reset the system back to normal
+ *
+ * If cpusets were created, this destroys them and puts all tasks
+ * back to the main cgroup.
+ */
 static void teardown(void)
 {
 	int fd;
@@ -642,6 +935,13 @@ static void teardown(void)
 	destroy_cpuset(CPUSET_LOCAL, 1);
 }
 
+/**
+ * bind_cpu - Set the affinity of a thread to a specific CPU.
+ * @cpu: The CPU to bind to.
+ *
+ * Sets the current thread to have an affinity of a sigle CPU.
+ * Does not work on SCHED_DEADLINE tasks.
+ */
 static void bind_cpu(int cpu)
 {
 	int ret;
@@ -655,6 +955,12 @@ static void bind_cpu(int cpu)
 		perror("sched_setaffinity bind");
 }
 
+/**
+ * unbind_cpu - Set the affinity of a task to all CPUs
+ *
+ * Sets the current thread to have an affinity for all CPUs.
+ * Does not work on SCHED_DEADLINE tasks.
+ */
 static void unbind_cpu(void)
 {
 	int cpu;
@@ -668,6 +974,9 @@ static void unbind_cpu(void)
 		perror("sched_setaffinity unbind");
 }
 
+/*
+ * Used by set_prio, but can be used for any task not just current.
+ */
 static int set_thread_prio(pid_t pid, int prio)
 {
 	struct sched_param sp = { .sched_priority = prio };
@@ -680,28 +989,32 @@ static int set_thread_prio(pid_t pid, int prio)
 	return sched_setscheduler(pid, policy, &sp);
 }
 
+/**
+ * set_prio - Set the SCHED_FIFO priority of a thread
+ * @prio: The priority to set a thread to
+ *
+ * Converts a SCHED_OTHER task into a SCHED_FIFO task and sets
+ * its priority to @prio. If @prio is zero, then it converts
+ * a SCHED_FIFO task back to a SCHED_OTHER task.
+ *
+ * Returns 0 on success, otherwise it failed.
+ */
 static int set_prio(int prio)
 {
 	return set_thread_prio(0, prio);
 }
 
-static void usage(char **argv)
-{
-	char *arg = argv[0];
-	char *p = arg+strlen(arg);
-
-	while (p >= arg && *p != '/')
-		p--;
-	p++;
-
-	printf("usage: %s\n"
-	       "\n",p);
-	exit(-1);
-}
-
+/* done - set when the test is complete to have all threads stop */
 static int done;
+
+/* fail - set during setup if any thread fails to initialize. */
 static int fail;
 
+/**
+ * get_time_us - Git the current clock time in microseconds
+ *
+ * Returns the current clock time in microseconds.
+ */
 static u64 get_time_us(void)
 {
 	struct timespec ts;
@@ -714,6 +1027,13 @@ static u64 get_time_us(void)
 	return time;
 }
 
+/**
+ * run_loops - execute a number of loops to perform
+ * @loops: The number of loops to execute.
+ *
+ * Executes the system call getcpu(), multiple times to simulate a
+ * task.
+ */
 static u64 run_loops(u64 loops)
 {
 	u64 start = get_time_us();
@@ -729,6 +1049,7 @@ static u64 run_loops(u64 loops)
 	return end - start;
 }
 
+/* Helper function for read_ctx_switchs */
 static int get_value(const char *line)
 {
 	const char *p;
@@ -743,6 +1064,7 @@ static int get_value(const char *line)
 	return atoi(p);
 }
 
+/* Helper function for read_ctx_switchs */
 static int update_value(const char *line, int *val, const char *name)
 {
 	int ret;
@@ -757,6 +1079,16 @@ static int update_value(const char *line, int *val, const char *name)
 	return 0;
 }
 
+/**
+ * read_ctx_switches - read the scheduling information of a task
+ * @vol: Output to place number of voluntary schedules
+ * @nonvol: Output to place number of non-voluntary schedules (preemption)
+ * @migrate: Output to place the number of times the task migrated
+ *
+ * Reads /proc/<pid>/sched to get the statistics of the thread.
+ *
+ * For info only.
+ */
 static int read_ctx_switches(int *vol, int *nonvol, int *migrate)
 {
 	static int vol_once, nonvol_once;
@@ -817,6 +1149,30 @@ static int read_ctx_switches(int *vol, int *nonvol, int *migrate)
 	return 0;
 }
 
+/**
+ * do_runtime - Run a loop to simulate a specific task
+ * @tid: The thread ID
+ * @data: The sched_data descriptor
+ * @period: The time of the last period.
+ *
+ * Returns the expected next period.
+ *
+ * This simulates some task that needs to be completed within the deadline.
+ *
+ * Input:
+ *  @data->deadline_us - to calculate next peroid
+ *  @data->loops_per_peroid - to loop this amount of time
+ *
+ * Output:
+ *  @data->total_adjust - Time adjusted for starting a period early
+ *  @data->missed_deadlines - Counter of missed deadlines
+ *  @data->missed_periods - Counter of missed periods (started late)
+ *  @data->max_time - Maximum time it took to complete the loops
+ *  @data->min_time - Minimum time it took to complete the loops
+ *  @data->last_time - How much time it took to complete loops this time
+ *  @data->total_time - Total time it took to complete all loops
+ *  @data->nr_periods - Number of periods that were executed.
+ */
 static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 {
 	u64 next_period = period + data->deadline_us;
@@ -825,24 +1181,29 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 	u64 diff;
 	u64 time;
 
+	/*
+	 * next_period is our new deadline. If now is passed that point
+	 * we missed a period.
+	 */
 	if (now > next_period) {
 		ftrace_write(data->buff,
 			     "Missed a period start: %lld next: %lld now: %lld\n",
 			     period, next_period, now);
+		/* See how many periods were missed. */
 		while (next_period < now) {
 			next_period += data->deadline_us;
 			data->missed_periods++;
 		}
-#if 0
-		printf("[%ld] Missed a period last: %lld start: %lld\n", tid,
-		       last_period_start, start);
-#endif
 	} else if (now < period) {
 		u64 delta = period - now;
 		/*
-		 * The period could be off due to other deadline tasks
-		 * preempting us when we started. If that's the case then
-		 * adjust the current period.
+		 * Currently, there's no way to find when the period actually
+		 * does begin. If the first runtime starts late, due to another
+		 * deadline task with a shorter deadline running, then it is
+		 * possible that the next period comes in quicker than we
+		 * expect it to.
+		 *
+		 * Adjust the period to start at now, and record the shift.
 		 */
 		ftrace_write(data->buff,
 			     "Adjusting period: now: %lld period: %lld delta:%lld%s\n",
@@ -855,16 +1216,17 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 
 	ftrace_write(data->buff, "start at %lld off=%lld (period=%lld next=%lld)\n",
 		     now, now - period, period, next_period);
+
+	/* Run the simulate task (loops) */
 	time = run_loops(data->loops_per_period);
 
 	end = get_time_us();
 
+	/* Did we make our deadline? */
 	if (end > next_period) {
 		ftrace_write(data->buff,
-			     "Failed runtime by %lld\n",
-			     end - next_period);
+			     "Failed runtime by %lld\n", end - next_period);
 		data->missed_deadlines++;
-		data->last_deadline_missed = end - next_period;
 		/*
 		 * We missed our deadline, which means we entered the
 		 * next period. Move it forward one, if we moved it too
@@ -889,6 +1251,24 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 	return next_period;
 }
 
+/**
+ * run_deadline - Run deadline thread
+ * @data: sched_data descriptor
+ *
+ * This is called by pthread_create() and executes the sched deadline
+ * task. @data has the following:
+ *
+ * Input:
+ *  @data->runtime_us: The amount of requested runtime in microseconds
+ *  @data->deadline_us: The requested deadline in microseconds
+ *  @data->loops_per_period: The number of loops to make during its runtime
+ *
+ * Output:
+ *  @data->tid: The thread ID
+ *  @data->vol: The number of times the thread voluntarily scheduled out
+ *  @data->nonvol: The number of times the thread non-voluntarily scheduled out
+ *  @data->migrate: The number of times the thread migrated across CPUs.
+ */
 void *run_deadline(void *data)
 {
 	struct sched_data *sched_data = data;
@@ -982,6 +1362,16 @@ void *run_deadline(void *data)
 	return NULL;
 }
 
+/**
+ * run_rt_spin - the Real-Time task spinner
+ * @data: The sched_data descriptor
+ *
+ * This function is called as a thread function. It will read @data->prio
+ * and set its priority base on that parameter. It sets @data->tid to the
+ * thread ID. Then after waiting through pthread barriers to sync with
+ * the main thread as well as with sched deadline threads, it will
+ * run in a tight loop until the global variable "done" is set.
+ */
 void *run_rt_spin(void *data)
 {
 	struct sched_data *sched_data = data;
@@ -1024,6 +1414,18 @@ struct cpu_list {
 	int		end_cpu;
 };
 
+/**
+ * add_cpus - Add cpus to cpu_list based on the passed in range
+ * @cpu_list: The cpu list to add to
+ * @start_cpu: The start of the range to add
+ * @end_cpu: The end of the range to add.
+ *
+ * Adds a sorted unique item into @cpu_list based on @start_cpu and @end_cpu.
+ * It removes duplicates in @cpu_list, and will even merge lists if a
+ * new range is entered that will fill a gap. That is, if @cpu_list has
+ * "1-3" and "6-7", and @start_cpu is 4 and @end_cpu is 5, it will combined
+ * the two elements into a single list item of "1-7".
+ */
 static void add_cpus(struct cpu_list **cpu_list, int start_cpu, int end_cpu)
 {
 	struct cpu_list *list;
@@ -1069,6 +1471,18 @@ static void add_cpus(struct cpu_list **cpu_list, int start_cpu, int end_cpu)
 	(*cpu_list)->next = list;
 }
 
+/**
+ * count_cpus - Return the number of CPUs in a list
+ * @cpu_list: The list of CPUs to count
+ *
+ * Reads the list of CPUs in @cpu_list. It als will free the
+ * list as it reads it, so this can only be called once on @cpu_list.
+ * It also checks if the CPUs in @cpu_list are less than cpu_count
+ * (the number of discovered CPUs).
+ *
+ * Returns the number of CPUs in @cpu_list, or -1 if any CPU in
+ * @cpu_list is greater or equal to cpu_count.
+ */
 static int count_cpus(struct cpu_list *cpu_list)
 {
 	struct cpu_list *list;
@@ -1086,6 +1500,17 @@ static int count_cpus(struct cpu_list *cpu_list)
 	return fail ? -1 : cpus;
 }
 
+/**
+ * append_cpus - Append a set of consecutive cpus to a string
+ * @buf: The string to append to
+ * @start: The cpu to start at.
+ * @end: The cpu to end at.
+ * @comma: The "," or "" to append before the cpu list.
+ * @total: The total length of buf.
+ *
+ * Realloc @buf to include @comma@start-@end.
+ * Updates @total to the new length of @buf.
+ */
 static char *append_cpus(char *buf, int start, int end,
 			 const char *comma, int *total)
 {
@@ -1107,6 +1532,16 @@ static char *append_cpus(char *buf, int start, int end,
 	return buf;
 }
 
+/**
+ * make_new_list - convert cpu_list into a string
+ * @cpu_list: The list of CPUs to include
+ * @buf: The pointer to the allocated string to return
+ *
+ * Reads @cpu_list which contains a link list of consecutive
+ * CPUs, and returns the combined list in @buf.
+ * If cpu_list has "1", "3" and "6-8", buf would return
+ * "1,3,6-8"
+ */
 static void make_new_list(struct cpu_list *cpu_list, char **buf)
 {
 	char *comma = "";
@@ -1120,6 +1555,18 @@ static void make_new_list(struct cpu_list *cpu_list, char **buf)
 	}
 }
 
+/**
+ * make_other_cpu_list - parse cpu list and return all other CPUs
+ * @setcpu: string listing the CPUs to exclude
+ * @cpus: The buffer to return the list of CPUs not in setcpu.
+ *
+ * @setcpu is expected to be compressed by calc_nr_cpus().
+ *
+ * Reads @setcpu and uses cpu_count (number of all CPUs), to return
+ * a list of CPUs not included in @setcpu. For example, if
+ * @setcpu is "1-5" and cpu_count is 8, then @cpus would contain
+ * "0,6-7".
+ */
 static void make_other_cpu_list(const char *setcpu, char **cpus)
 {
 	const char *p = setcpu;
@@ -1154,6 +1601,17 @@ static void make_other_cpu_list(const char *setcpu, char **cpus)
 	}
 }
 
+/**
+ * calc_nr_cpus - parse cpu list for list of cpus.
+ * @setcpu: string listing the CPUs to include
+ * @buf: The buffer to return as a compressed list.
+ *
+ * Reads @setcpu and removes duplicates, it also sets @buf to be
+ * a consolidated list. For example, if @setcpu is "1,2,4,3-5"
+ * @buf would become "1-5" and 5 would be returned.
+ *
+ * Returns the number of cpus listed in @setcpu.
+ */
 static int calc_nr_cpus(const char *setcpu, char **buf)
 {
 	struct cpu_list *cpu_list = NULL;
@@ -1284,13 +1742,14 @@ int main (int argc, char **argv)
 	pthread_t rt_thread;
 	unsigned int interval = 1000;
 	unsigned int step = 500;
+	u64 loop_time;
 	u64 loops;
 	u64 runtime;
 	u64 overhead;
 	u64 start_period;
 	u64 end_period;
 	int nr_cpus;
-	int all_cpus = 0;
+	int all_cpus = 1;
 	int run_percent = 100;
 	int percent = 80;
 	int rt_task = 0;
@@ -1303,12 +1762,13 @@ int main (int argc, char **argv)
 		exit(-1);
 	}
 
-	while ((c = getopt(argc, argv, "+hr:ac:p:P:t:")) >= 0) {
+	while ((c = getopt(argc, argv, "+hbr:c:p:P:t:")) >= 0) {
 		switch (c) {
-		case 'a':
-			all_cpus = 1;
+		case 'b':
+			all_cpus = 0;
 			break;
 		case 'c':
+			all_cpus = 0;
 			setcpu = optarg;
 			break;
 		case 'i':
@@ -1359,7 +1819,7 @@ int main (int argc, char **argv)
 		all_cpus = 1;
 	}
 
-	/* Default cpu to use is the last one */
+	/* -b has us bind to the last CPU. */
 	if (!all_cpus && !setcpu) {
 		setcpu_buf = malloc(10);
 		if (!setcpu_buf) {
@@ -1368,8 +1828,6 @@ int main (int argc, char **argv)
 		}
 		sprintf(setcpu_buf, "%d", cpu_count - 1);
 	}
-
-	setcpu = setcpu_buf;
 
 	if (setcpu)
 		make_other_cpu_list(setcpu, &allcpu_buf);
@@ -1448,8 +1906,8 @@ int main (int argc, char **argv)
 		 * take 5% off of it.
 		 *  loops * %run_percent / 1000
 		 */
-		sd->loop_time = runtime * run_percent / 100;
-		sd->loops_per_period = sd->loop_time * loops / 1000;
+		loop_time = runtime * run_percent / 100;
+		sd->loops_per_period = loop_time * loops / 1000;
 
 		printf("loops per period = %lld\n", sd->loops_per_period);
 
@@ -1518,7 +1976,6 @@ int main (int argc, char **argv)
 		int *pids;
 
 		res = make_cpuset(CPUSET_ALL, allcpu_buf, "0",
-//				  CPUSET_FL_CPU_EXCLUSIVE |
 				  CPUSET_FL_SET_LOADBALANCE |
 				  CPUSET_FL_CLONE_CHILDREN |
 				  CPUSET_FL_ALL_TASKS);
