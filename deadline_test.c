@@ -83,7 +83,7 @@ static void usage(char **argv)
 
 /*
  * sched_setattr() and sched_getattr() are new system calls. We need to
- * hardcode it here. For added measure, also define getcpu().
+ * hardcode it here.
  */
 #if defined(__i386__)
 
@@ -92,9 +92,6 @@ static void usage(char **argv)
 #endif
 #ifndef __NR_sched_getattr
 #define __NR_sched_getattr		352
-#endif
-#ifndef __NR_getcpu
-#define __NR_getcpu			309
 #endif
 
 #elif defined(__x86_64__)
@@ -105,15 +102,8 @@ static void usage(char **argv)
 #ifndef __NR_sched_getattr
 #define __NR_sched_getattr		315
 #endif
-#ifndef __NR_getcpu
-#define __NR_getcpu			309
-#endif
 
 #endif /* i386 or x86_64 */
-
-#if !defined(__NR_getcpu)
-# error "Your arch does not support getcpu()"
-#endif
 
 #if !defined(__NR_sched_setattr)
 # error "Your arch does not support sched_setattr()"
@@ -151,7 +141,6 @@ static void usage(char **argv)
 #define gettid() syscall(__NR_gettid)
 #define sched_setattr(pid, attr, flags) syscall(__NR_sched_setattr, pid, attr, flags)
 #define sched_getattr(pid, attr, size, flags) syscall(__NR_sched_getattr, pid, attr, size, flags)
-#define getcpu(cpup, nodep, unused) syscall(__NR_getcpu, cpup, nodep, unused)
 
 typedef unsigned long long u64;
 typedef unsigned int u32;
@@ -202,6 +191,7 @@ struct sched_attr {
  * @min_time: Recorded min time to complete loops
  * @total_time: The total time of all periods to perform the loops
  * @nr_periods: The number of periods executed
+ * @prime: Calculating a prime number.
  * @missed_periods: The number of periods that were missed (started late)
  * @missed_deadlines: The number of deadlines that were missed (ended late)
  * @total_adjust: The time in microseconds adjusted for starting early
@@ -225,6 +215,8 @@ struct sched_data {
 	u64 total_time;
 	u64 nr_periods;
 
+	u64 prime;
+
 	int missed_periods;
 	int missed_deadlines;
 	u64 total_adjust;
@@ -239,6 +231,9 @@ struct sched_data {
 	int migrate;
 
 	char buff[BUFSIZ+1];
+
+	/* Try to keep each sched_data out of cache lines */
+	char padding[256];
 };
 
 /* Barrier to synchronize the threads for initialization */
@@ -490,9 +485,10 @@ static int setup_hr_tick(void)
 		return 0;
 
 	fd = open(files, O_RDWR);
-	perror(files);
-	if (fd < 0)
+	if (fd < 0) {
+		perror(files);
 		return 0;
+	}
 
 	len = sizeof(buf);
 
@@ -946,7 +942,6 @@ static void bind_cpu(int cpu)
 {
 	int ret;
 
-	printf("bind %d\n", cpu);
 	CPU_ZERO_S(cpuset_size, cpusetp);
 	CPU_SET_S(cpu, cpuset_size, cpusetp);
 
@@ -1031,20 +1026,42 @@ static u64 get_time_us(void)
  * run_loops - execute a number of loops to perform
  * @loops: The number of loops to execute.
  *
- * Executes the system call getcpu(), multiple times to simulate a
- * task.
+ * Calculates prime numbers, because what else should we do?
  */
-static u64 run_loops(u64 loops)
+static u64 run_loops(struct sched_data *data, u64 *loops)
 {
 	u64 start = get_time_us();
 	u64 end;
 	u64 i;
-	int cpu;
+	u64 l = *loops;
+	u64 prime;
+	u64 cnt = 2;
+	u64 result;
 
-	for (i = 0; i < loops; i++) {
-		getcpu(&cpu, NULL, NULL);
+	prime = data->prime;
+
+	for (i = 0; !l || i < l; i++) {
+		if (cnt > prime / 2) {
+			data->prime = prime;
+			prime++;
+			cnt = 2;
+		}
+		result = prime / cnt;
+		if (result * cnt == prime) {
+			prime++;
+			cnt = 2;
+		} else
+			cnt++;
+
 		end = get_time_us();
+		if (!l && end > (start + 1000))
+			break;
 	}
+
+	asm("":::"memory");
+
+	if (!l)
+		*loops = i;
 
 	return end - start;
 }
@@ -1218,7 +1235,7 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 		     now, now - period, period, next_period);
 
 	/* Run the simulate task (loops) */
-	time = run_loops(data->loops_per_period);
+	time = run_loops(data, &data->loops_per_period);
 
 	end = get_time_us();
 
@@ -1298,6 +1315,7 @@ void *run_deadline(void *data)
 	printf("deadline thread %ld\n", tid);
 
 	sched_data->tid = tid;
+	sched_data->prime = 2;
 
 	ret = sched_getattr(0, &attr, sizeof(attr), 0);
 	if (ret < 0) {
@@ -1674,22 +1692,36 @@ static void sleep_to(u64 next)
 	nanosleep(&req, NULL);
 }
 
+/**
+ * calculate_loops_per_ms - calculate the number of loops per ms
+ * @overhead: Return the overhead of the call around run_loops()
+ *
+ * Runs the do_runtime() to see how long it takes. That returns
+ * how long the loops took (data->last_time), and the overhead can
+ * be calculated by that diff.
+ *
+ * Returns the length of time it took to run for 1000 loops.
+ */
 static u64 calculate_loops_per_ms(u64 *overhead)
 {
 	struct sched_data sd = { };
+	u64 test_loops = 0;
 	u64 loops;
 	u64 diff;
 	u64 odiff;
 	u64 start;
 	u64 end;
 
-#define TEST_LOOPS 1000
+	sd.prime = 2;
+
+	/* Will assign test_loops to how many loops for 1ms */
+	start = run_loops(&sd, &test_loops);
 
 	sleep_to(get_time_us() + 1000);
 
 	sd.deadline_us = 2000;
 	sd.runtime_us = 1000;
-	sd.loops_per_period = TEST_LOOPS;
+	sd.loops_per_period = test_loops;
 
 	start = get_time_us();
 	do_runtime(0, &sd, start + sd.deadline_us);
@@ -1698,13 +1730,15 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 	diff = end - start;
 
 	/*
-	 * diff / TEST_LOOPS = 1000us / loops
-	 * loops = TEST_LOOPS * 1000us / diff
+	 * last_time / test_loops = 1000us / loops
+	 *               or
+	 * loops = test_loops * 1000us / last_time
 	 */
 
-	loops = 1000 * TEST_LOOPS / diff;
+	loops = 1000ULL * test_loops / sd.last_time;
 
-	printf("loops=%lld diff=%lld for %d loops\n", loops, diff, TEST_LOOPS);
+	printf("loops=%lld test_loop=%lld diff=%lld time=%lld for %lld loops\n",
+	       loops, test_loops, diff, sd.last_time, test_loops);
 
 	sd.deadline_us = 2000;
 	sd.runtime_us = 1000;
@@ -1718,7 +1752,7 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 
 	odiff = end - start;
 
-	loops = TEST_LOOPS * 1000 / sd.last_time;
+	loops = 1000ULL * loops / sd.last_time;
 
 	*overhead = odiff - sd.last_time;
 
@@ -1814,10 +1848,11 @@ int main (int argc, char **argv)
 	} else
 		nr_cpus = 1;
 
-	if (!all_cpus && setcpu && cpu_count == nr_cpus) {
-		printf("Using all CPUS\n");
+	if (all_cpus)
+		nr_cpus = cpu_count;
+
+	if (cpu_count == nr_cpus)
 		all_cpus = 1;
-	}
 
 	/* -b has us bind to the last CPU. */
 	if (!all_cpus && !setcpu) {
@@ -1827,10 +1862,8 @@ int main (int argc, char **argv)
 			exit(-1);
 		}
 		sprintf(setcpu_buf, "%d", cpu_count - 1);
+		setcpu = setcpu_buf;
 	}
-
-	if (setcpu)
-		make_other_cpu_list(setcpu, &allcpu_buf);
 
 	/*
 	 * Now the amount of bandwidth each tasks takes will be
@@ -1841,12 +1874,6 @@ int main (int argc, char **argv)
 	percent = (percent * nr_cpus) / nr_threads;
 	if (percent > 90)
 		percent = 90;
-	printf("percent = %d\n", percent);
-	printf("nr_cpus=%d %s\n", nr_cpus, setcpu);
-
-	if (mlockall(MCL_CURRENT|MCL_FUTURE) == -1) {
-		perror("mlockall");
-	}
 
 	cpusetp = CPU_ALLOC(cpu_count);
 	cpuset_size = CPU_ALLOC_SIZE(cpu_count);
@@ -1864,14 +1891,29 @@ int main (int argc, char **argv)
 		exit(-1);
 	}
 
-	set_prio(99);
+	if (mlockall(MCL_CURRENT|MCL_FUTURE) == -1) {
+		perror("mlockall");
+	}
 
+	/*
+	 * Run at prio 99 bound to the last CPU, and try to calculate
+	 * the time it takes to run the loops.
+	 */
+	set_prio(99);
 	bind_cpu(cpu_count - 1);
 
 	loops = calculate_loops_per_ms(&overhead);
 
-	printf("loops=%lld overhead=%lld\n", loops, overhead);
+	printf("Setup:\n");
+	printf(" percent:%d", percent);
+	if (run_percent < 100)
+		printf(" run-percent:%d", run_percent);
+	printf(" nr_cpus:%d", nr_cpus);
+	if (setcpu)
+		printf(" (%s)", setcpu);
+	printf(" loops:%lld overhead:%lldus\n", loops, overhead);
 
+ again:
 	/* Set up the data while sill in SCHED_FIFO */
 	for (i = 0; i < nr_threads; i++) {
 		sd = &sched_data[i];
@@ -1909,19 +1951,18 @@ int main (int argc, char **argv)
 		loop_time = runtime * run_percent / 100;
 		sd->loops_per_period = loop_time * loops / 1000;
 
-		printf("loops per period = %lld\n", sd->loops_per_period);
-
 		sd->deadline_us = interval;
-		printf("interval: %lld:%lld\n", sd->runtime_us, sd->deadline_us);
 
 		/* Make sure that we can make our deadlines */
 		start_period = get_time_us();
 		do_runtime(gettid(), sd, start_period);
 		end_period = get_time_us();
 		if (end_period - start_period > sd->runtime_us) {
-			fprintf(stderr, "Failed to perform task within runtime: Missed by %lld us\n",
+			printf("Failed to perform task within runtime: Missed by %lld us\n",
 				end_period - start_period - sd->runtime_us);
-			exit(-1);
+			overhead += end_period - start_period - sd->runtime_us;
+			printf("New overhead=%lldus\n", overhead);
+			goto again;
 		}
 
 		printf("  Tested at %lldus of %lldus\n",
@@ -1975,6 +2016,8 @@ int main (int argc, char **argv)
 	if (!all_cpus) {
 		int *pids;
 
+		make_other_cpu_list(setcpu, &allcpu_buf);
+
 		res = make_cpuset(CPUSET_ALL, allcpu_buf, "0",
 				  CPUSET_FL_SET_LOADBALANCE |
 				  CPUSET_FL_CLONE_CHILDREN |
@@ -2009,10 +2052,7 @@ int main (int argc, char **argv)
 		system("cat /sys/fs/cgroup/cpuset/my_cpuset/tasks");
 	}
 
-	printf("main thread %ld\n", gettid());
-
 	pthread_barrier_wait(&barrier);
-	printf("fail 2 %d\n", fail);
 
 	if (fail)
 		exit(-1);
@@ -2021,7 +2061,6 @@ int main (int argc, char **argv)
 
 	if (!fail)
 		sleep(10);
-	printf("fail 3? %d \n", fail);
 
 	done = 1;
 	if (rt_task) {
@@ -2041,17 +2080,18 @@ int main (int argc, char **argv)
 		}
 
 		printf("\n[%d]\n", sd->tid);
-		printf("deadline : %lld us\n", sd->deadline_us);
-		printf("runtime  : %lld us\n", sd->runtime_us);
-		printf("max_time  = %lld\n", sd->max_time);
-		printf("min_time  = %lld\n", sd->min_time);
-		printf("avg_time  = %lld\n", sd->total_time / sd->nr_periods);
-		printf("nr_periods        = %lld\n", sd->nr_periods);
 		printf("missed deadlines  = %d\n", sd->missed_deadlines);
 		printf("missed periods    = %d\n", sd->missed_periods);
 		printf("Total adjustments = %lld us\n", sd->total_adjust);
+		printf("deadline   : %lld us\n", sd->deadline_us);
+		printf("runtime    : %lld us\n", sd->runtime_us);
+		printf("nr_periods : %lld\n", sd->nr_periods);
+		printf("max_time: %lldus", sd->max_time);
+		printf("\tmin_time: %lldus", sd->min_time);
+		printf("\tavg_time: %lldus\n", sd->total_time / sd->nr_periods);
 		printf("ctx switches vol:%d nonvol:%d migration:%d\n",
 		       sd->vol, sd->nonvol, sd->migrate);
+		printf("highes prime: %lld\n", sd->prime);
 		printf("\n");
 	}
 
