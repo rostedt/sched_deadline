@@ -1673,14 +1673,10 @@ static const char *join_thread(pthread_t *thread)
 	return result;
 }
 
-static void sleep_to(u64 next)
+static void do_sleep(u64 next)
 {
 	struct timespec req;
-	u64 now = get_time_us();
 
-	if (now > next)
-		return;
-	next -= now;
 	req.tv_nsec = next * 1000;
 	req.tv_sec = 0;
 	while (req.tv_nsec > 1000000000UL) {
@@ -1713,7 +1709,7 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 	sd.prime = 2;
 
 	/* Sleep 1ms to help flush a bit of cache */
-	sleep_to(get_time_us() + 1000);
+	do_sleep(1000);
 
 	start = run_loops(&sd, test_loops);
 
@@ -1722,7 +1718,7 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 	sd.loops_per_period = test_loops;
 
 	/* Again try to dirty some cache */
-	sleep_to(get_time_us() + 1000);
+	do_sleep(1000);
 
 	start = get_time_us();
 	do_runtime(0, &sd, start + sd.deadline_us);
@@ -1751,7 +1747,7 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 
 	test_loops = loops;
 
-	sleep_to(get_time_us() + 1000);
+	do_sleep(1000);
 
 	start = get_time_us();
 	do_runtime(0, &sd, start + sd.deadline_us);
