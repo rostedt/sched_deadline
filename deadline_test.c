@@ -195,6 +195,7 @@ struct sched_attr {
  * @missed_periods: The number of periods that were missed (started late)
  * @missed_deadlines: The number of deadlines that were missed (ended late)
  * @total_adjust: The time in microseconds adjusted for starting early
+ * @nr_adjust: The number of times adjusted for starting early
  * @last_time: Last runtime of loops (used to calculate runtime to give)
  * @prio: The priority for SCHED_FIFO threads (uses same descriptor)
  * @tid: Stores the thread ID of the thread.
@@ -220,6 +221,7 @@ struct sched_data {
 	int missed_periods;
 	int missed_deadlines;
 	u64 total_adjust;
+	u64 nr_adjust;
 
 	u64 last_time;
 
@@ -1182,6 +1184,7 @@ static int read_ctx_switches(int *vol, int *nonvol, int *migrate)
  *
  * Output:
  *  @data->total_adjust - Time adjusted for starting a period early
+ *  @data->nr_adjusted - Number of times adjusted
  *  @data->missed_deadlines - Counter of missed deadlines
  *  @data->missed_periods - Counter of missed periods (started late)
  *  @data->max_time - Maximum time it took to complete the loops
@@ -1227,6 +1230,7 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 			     now, period, delta, delta > data->deadline_us / 2 ?
 			     " HUGE ADJUSTMENT" : "");
 		data->total_adjust += delta;
+		data->nr_adjust++;
 		period = now;
 		next_period = period + data->deadline_us;
 	}
@@ -2083,6 +2087,8 @@ int main (int argc, char **argv)
 		printf("missed deadlines  = %d\n", sd->missed_deadlines);
 		printf("missed periods    = %d\n", sd->missed_periods);
 		printf("Total adjustments = %lld us\n", sd->total_adjust);
+		printf("# adjustments = %lld avg: %lld us\n",
+		       sd->nr_adjust, sd->total_adjust / sd->nr_adjust);
 		printf("deadline   : %lld us\n", sd->deadline_us);
 		printf("runtime    : %lld us\n", sd->runtime_us);
 		printf("nr_periods : %lld\n", sd->nr_periods);
