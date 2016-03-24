@@ -1986,10 +1986,10 @@ int main (int argc, char **argv)
 		pthread_create(&thread[i], NULL, run_deadline, sd);
 	}
 
-	/* Make sure we are a higher priority than the spinner */
-	set_prio(rt_task + 1);
-
 	if (rt_task) {
+		/* Make sure we are a higher priority than the spinner */
+		set_prio(rt_task + 1);
+
 		rt_sched_data.prio = rt_task;
 		pthread_create(&rt_thread, NULL, run_rt_spin, &rt_sched_data);
 	}
