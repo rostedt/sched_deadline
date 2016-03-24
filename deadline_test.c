@@ -1030,19 +1030,18 @@ static u64 get_time_us(void)
  *
  * Calculates prime numbers, because what else should we do?
  */
-static u64 run_loops(struct sched_data *data, u64 *loops)
+static u64 run_loops(struct sched_data *data, u64 loops)
 {
 	u64 start = get_time_us();
 	u64 end;
 	u64 i;
-	u64 l = *loops;
 	u64 prime;
 	u64 cnt = 2;
 	u64 result;
 
 	prime = data->prime;
 
-	for (i = 0; !l || i < l; i++) {
+	for (i = 0; i < loops; i++) {
 		if (cnt > prime / 2) {
 			data->prime = prime;
 			prime++;
@@ -1054,17 +1053,12 @@ static u64 run_loops(struct sched_data *data, u64 *loops)
 			cnt = 2;
 		} else
 			cnt++;
-
-		end = get_time_us();
-		if (!l && end > (start + 1000))
-			break;
 	}
 
+	/* Memory barrier */
 	asm("":::"memory");
 
-	if (!l)
-		*loops = i;
-
+	end = get_time_us();
 	return end - start;
 }
 
@@ -1239,7 +1233,7 @@ static u64 do_runtime(long tid, struct sched_data *data, u64 period)
 		     now, now - period, period, next_period);
 
 	/* Run the simulate task (loops) */
-	time = run_loops(data, &data->loops_per_period);
+	time = run_loops(data, data->loops_per_period);
 
 	end = get_time_us();
 
@@ -1709,7 +1703,7 @@ static void sleep_to(u64 next)
 static u64 calculate_loops_per_ms(u64 *overhead)
 {
 	struct sched_data sd = { };
-	u64 test_loops = 0;
+	u64 test_loops = 100000;
 	u64 loops;
 	u64 diff;
 	u64 odiff;
@@ -1718,14 +1712,17 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 
 	sd.prime = 2;
 
-	/* Will assign test_loops to how many loops for 1ms */
-	start = run_loops(&sd, &test_loops);
-
+	/* Sleep 1ms to help flush a bit of cache */
 	sleep_to(get_time_us() + 1000);
 
-	sd.deadline_us = 2000;
-	sd.runtime_us = 1000;
+	start = run_loops(&sd, test_loops);
+
+	sd.deadline_us = start * 2;
+	sd.runtime_us = start;
 	sd.loops_per_period = test_loops;
+
+	/* Again try to dirty some cache */
+	sleep_to(get_time_us() + 1000);
 
 	start = get_time_us();
 	do_runtime(0, &sd, start + sd.deadline_us);
@@ -1734,6 +1731,9 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 	diff = end - start;
 
 	/*
+	 * Based on the time it took to run test_loops, figure
+	 * out how many loops it may take to run for 1000us.
+	 *
 	 * last_time / test_loops = 1000us / loops
 	 *               or
 	 * loops = test_loops * 1000us / last_time
@@ -1741,12 +1741,15 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 
 	loops = 1000ULL * test_loops / sd.last_time;
 
-	printf("loops=%lld test_loop=%lld diff=%lld time=%lld for %lld loops\n",
-	       loops, test_loops, diff, sd.last_time, test_loops);
+	printf("%lld test loops took %lldus total (%lld internal)\n"
+	       "calculated loops for 1000us=%lld\n",
+	       test_loops, diff, sd.last_time, loops);
 
 	sd.deadline_us = 2000;
 	sd.runtime_us = 1000;
 	sd.loops_per_period = loops;
+
+	test_loops = loops;
 
 	sleep_to(get_time_us() + 1000);
 
@@ -1756,13 +1759,18 @@ static u64 calculate_loops_per_ms(u64 *overhead)
 
 	odiff = end - start;
 
+	/*
+	 * Use this new calcualtion to recalculate the number of loops
+	 * for 1000us
+	 */
 	loops = 1000ULL * loops / sd.last_time;
 
 	*overhead = odiff - sd.last_time;
 
-	printf("loops=%lld overhead=%lldus last_time=%lld diff=%lld\n",
-	       loops, *overhead, sd.last_time, odiff - diff);
-
+	printf("%lld test loops took %lldus total (%lld internal)\n"
+	       "New calculated loops for 1000us=%lld\n"
+	       "Diff from last calculation: %lld loops\n",
+	       test_loops, odiff, sd.last_time, loops, loops - test_loops);
 
 	return loops;
 }
