@@ -2001,7 +2001,6 @@ int main (int argc, char **argv)
 	pthread_barrier_wait(&barrier);
 
 	if (fail) {
-		printf("fail 1\n");
 		exit(-1);
 	}
 
