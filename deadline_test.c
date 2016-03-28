@@ -1998,22 +1998,6 @@ int main (int argc, char **argv)
 		pthread_create(&rt_thread, NULL, run_rt_spin, &rt_sched_data);
 	}
 
-#if 0
-	sd = &sched_data[0];
-	sd->runtime_us = 20 * 1000;
-	sd->deadline_us = 30 * 1000;
-	sd->loops_per_period = (loops * 20 * 95)/100 - readctx * 2;
-	pthread_create(&thread[0], NULL, run_deadline, sd);
-
-	sd = &sched_data[1];
-	sd->runtime_us = 20 * 1000;
-	sd->deadline_us = 200 * 1000;
-	sd->loops_per_period = (loops * 20 * 95)/100 - readctx * 2;
-	pthread_create(&thread[1], NULL, run_deadline, sd);
-
-#endif
-	atexit(teardown);
-
 	pthread_barrier_wait(&barrier);
 
 	if (fail) {
@@ -2023,6 +2007,8 @@ int main (int argc, char **argv)
 
 	if (!all_cpus) {
 		int *pids;
+
+		atexit(teardown);
 
 		make_other_cpu_list(setcpu, &allcpu_buf);
 
@@ -2054,6 +2040,7 @@ int main (int argc, char **argv)
 		free(pids);
 		if (res) {
 			perror(res);
+			fprintf(stderr, "Check if other cpusets exist that conflict\n");
 			exit(-1);
 		}
 
