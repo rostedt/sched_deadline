@@ -77,6 +77,7 @@ static void usage(char **argv)
 	       " -P percent - The percent of runtime for execution completion\n"
 	       "              (Default 100%%)\n"
 	       " -t threads - The number of threads to run as deadline (default 1)\n"
+	       " -s step(us) - The amount to increase the deadline for each task (default 500us)\n"
 	       "\n", p);
 	exit(-1);
 }
@@ -1804,7 +1805,7 @@ int main (int argc, char **argv)
 		exit(-1);
 	}
 
-	while ((c = getopt(argc, argv, "+hbr:c:p:P:t:")) >= 0) {
+	while ((c = getopt(argc, argv, "+hbr:c:p:P:t:s:")) >= 0) {
 		switch (c) {
 		case 'b':
 			all_cpus = 0;
@@ -1913,7 +1914,7 @@ int main (int argc, char **argv)
 	loops = calculate_loops_per_ms(&overhead);
 
 	printf("Setup:\n");
-	printf(" percent:%d", percent);
+	printf(" percent per task:%d", percent);
 	if (run_percent < 100)
 		printf(" run-percent:%d", run_percent);
 	printf(" nr_cpus:%d", nr_cpus);
