@@ -1,7 +1,8 @@
 CC = gcc
 CFLAGS = -g -Wall
 
-all: deadline_test cyclicdeadline
+ALL = deadline_test cyclicdeadline 
+all: ${ALL}
 
 deadline_test: deadline_test.o
 	$(CC) $^ -o $@ -lpthread -lrt
@@ -9,3 +10,5 @@ deadline_test: deadline_test.o
 cyclicdeadline: cyclicdeadline.o
 	$(CC) $^ -o $@ -lpthread -lrt
 
+clean:
+	${RM} *.o ${ALL}
