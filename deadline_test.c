@@ -2080,7 +2080,7 @@ int main (int argc, char **argv)
 		printf("missed periods    = %d\n", sd->missed_periods);
 		printf("Total adjustments = %lld us\n", sd->total_adjust);
 		printf("# adjustments = %lld avg: %lld us\n",
-		       sd->nr_adjust, sd->total_adjust / sd->nr_adjust);
+		       sd->nr_adjust, sd->nr_adjust ? sd->total_adjust / sd->nr_adjust : 0);
 		printf("deadline   : %lld us\n", sd->deadline_us);
 		printf("runtime    : %lld us\n", sd->runtime_us);
 		printf("nr_periods : %lld\n", sd->nr_periods);
